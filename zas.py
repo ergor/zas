@@ -10,9 +10,11 @@
 # label:
 # .directive
 
+import sys
 
 pc = 0      # program counter
-memory = [0] * 2**16
+#memory = [b'\x00'] * 2**16
+memory = bytearray(2**16)
 # where to write? memory[addr in label_refs]
 # what value to write? addr in label_defs
 label_refs = [
@@ -70,7 +72,7 @@ def src_reg(reg):
 # LD 100, r0   # error: should have used LDI
 def eval_imm(imm):
     typ = IMM_DATA
-    if imm[0] == "$":
+    if imm.startswith("$"):
         typ = IMM_ADDR
         imm = imm[1:]
     success, val = my_int(imm)
@@ -83,7 +85,15 @@ def eval_imm(imm):
 def split_bytes(val):
     high = (val >> 8) & 0xFF
     low  =  val       & 0xFF
-    return (high, low) # big endian order
+    return (high, low)
+
+
+def sanity(s):
+    for c in s:
+        if c == " " or c == "\t":
+            print(s + ": illegal whitespace")
+            exit(1)
+    return s
 
 
 ## SAFE WRAPPERS ##
@@ -91,10 +101,9 @@ def safe_get_oprs(op, oprs, n):
     if oprs == []:
         print(op + ": operands required")
         exit(1)
-
-    oprs = [o.strip() for o in oprs.split(',')]
+    oprs = [sanity(o.strip()) for o in oprs.split(',')]
     if len(oprs) != n:
-        print(op + ": expected " + n + " operands")
+        print(op + ": expected " + str(n) + " operands")
         exit(1)
     return oprs
 
@@ -131,7 +140,7 @@ def parse_reg2reg(op, oprs):
     return ( base_val + src_reg(rs) + dst_reg(rd), )
 
 
-def parse_ld_st(reg_evaluator):
+def parse_a16_reg(reg_evaluator):
     def parse(op, oprs):
         oprs = safe_get_oprs(op, oprs, 2)
         reg = oprs[0] if reg_evaluator == src_reg else oprs[1]
@@ -143,8 +152,19 @@ def parse_ld_st(reg_evaluator):
         base_val, _ = ops[op]
         high, low = split_bytes(imm)
         
-        return ( base_val + reg_evaluator(reg), high, low )
+        return ( base_val + reg_evaluator(reg), high, low ) # big endian order
     return parse
+
+
+def parse_a16(op, oprs):
+    oprs = safe_get_oprs(op, oprs, 1)
+
+    imm = safe_eval_imm(op, oprs[0], IMM_ADDR)
+
+    base_val, _ = ops[op]
+    high, low = split_bytes(imm)
+    
+    return ( base_val, high, low ) # big endian order
 
 
 def parse_ldi(op, oprs):
@@ -183,7 +203,7 @@ def parse_ln(string):
 
     if LABEL in ln:
         ln = ln.split(LABEL, 1)
-        lbl = ln[0].strip().upper()
+        lbl = sanity(ln[0].strip().upper())
         if len(lbl) < 1:
             print("label cannot be empty")
             exit(1)
@@ -203,55 +223,100 @@ def parse_ln(string):
     entry = ops.get(op)
     if entry is not None:
         _, parser = entry
-        data = parser(op, oprs)
+        data = bytes(parser(op, oprs))
         #print(data)
-        for i, byte in enumerate(data):
-            memory[pc + i] = byte
+        for byte in data:
+            if pc == len(memory):
+                print("program size exceeded memory size")
+                exit(1)
+            memory[pc] = byte
             pc += 1
+
+
     else:
         print(op + ": no such instruction")
         exit(1)
 
+
+def resolve_lbls():
+    for label, addr in label_refs:
+        if not label in label_defs.keys():
+            print(label + ": label referenced but not declared")
+            exit(2)
+        high, low = bytes(split_bytes(label_defs[label]))
+        # addr+0 is the opcode itself
+        memory[addr + 1] = high # big endian order
+        memory[addr + 2] = low
+
+
 ops = {
     # "name" : (base_value, parser_func)
-    "NOP" : (0o000, parse_no_oprs),
-    #"JMPS":(0o010, ),
-    #"JMPZ":(0o011, ),
-    #"JMPV":(0o012, ),
-    #"JMPC":(0o013, ),
-    #"JMPA":(0o014, ),
-    #"CALL":(0o015, ),
-    "RET" : (0o016, parse_no_oprs),
-    #"JMP" :(0o017, ),
-    #"JMPNS":(0o020, ),
-    #"JMPNZ":(0o021, ),
-    #"JMPNV":(0o022, ),
-    #"JMPNC":(0o023, ),
-    #"JMPNA":(0o024, ),
-    "POP" : (0o040, parse_single_reg(dst_reg)),
-    "LDI" : (0o050, parse_ldi),
-    "LD"  : (0o060, parse_ld_st(dst_reg)),
-    "IN"  : (0o070, parse_ld_st(dst_reg)),
-    "MOV" : (0o100, parse_reg2reg),
-    "ST"  : (0o200, parse_ld_st(src_reg)),
-    "SUB" : (0o202, parse_single_reg(src_reg)),
-    "ADD" : (0o203, parse_single_reg(src_reg)),
-    "XOR" : (0o204, parse_single_reg(src_reg)),
-    "OR"  : (0o205, parse_single_reg(src_reg)),
-    "AND" : (0o206, parse_single_reg(src_reg)),
-    "OUT" : (0o207, parse_ld_st(src_reg)),
-    "PUSH": (0o300, parse_single_reg(src_reg)),
-    "SBB" : (0o302, parse_single_reg(src_reg)),
-    "ADC" : (0o303, parse_single_reg(src_reg)),
-    "SHL" : (0o304, parse_single_reg(src_reg)),
-    "SHR" : (0o305, parse_single_reg(src_reg)),
+    # 1st quadrant: 0000-0077
+    "NOP"   : (0o000, parse_no_oprs),
+    "HLT"   : (0o001, parse_no_oprs),
+    "CLI"   : (0o002, parse_no_oprs),
+    "SEI"   : (0o003, parse_no_oprs),
+    "RETI"  : (0o004, parse_no_oprs),
+    "JMPS"  : (0o010, parse_a16),
+    "JMPZ"  : (0o011, parse_a16),
+    "JMPV"  : (0o012, parse_a16),
+    "JMPC"  : (0o013, parse_a16),
+    "JMPA"  : (0o014, parse_a16),
+    "CALL"  : (0o015, parse_a16),
+    "RET"   : (0o016, parse_no_oprs),
+    "JMP"   : (0o017, parse_a16),
+    "JMPNS" : (0o020, parse_a16),
+    "JMPNZ" : (0o021, parse_a16),
+    "JMPNV" : (0o022, parse_a16),
+    "JMPNC" : (0o023, parse_a16),
+    "JMPNA" : (0o024, parse_a16),
+    "POP"   : (0o040, parse_single_reg(dst_reg)),
+    "LDI"   : (0o050, parse_ldi),
+    "LD"    : (0o060, parse_a16_reg(dst_reg)),
+    "IN"    : (0o070, parse_a16_reg(dst_reg)),
+    # 2nd quadrant: 0100-0177
+    "MOV"   : (0o100, parse_reg2reg),
+    # 3rd quadrant: 0200-0277
+    "ST"    : (0o200, parse_a16_reg(src_reg)),
+    "CMP"   : (0o201, parse_single_reg(src_reg)),
+    "SUB"   : (0o202, parse_single_reg(src_reg)),
+    "ADD"   : (0o203, parse_single_reg(src_reg)),
+    "XOR"   : (0o204, parse_single_reg(src_reg)),
+    "OR"    : (0o205, parse_single_reg(src_reg)),
+    "AND"   : (0o206, parse_single_reg(src_reg)),
+    "OUT"   : (0o207, parse_a16_reg(src_reg)),
+    # 4th quadrant: 0300-0377
+    "PUSH"  : (0o300, parse_single_reg(src_reg)),
+    "SBB"   : (0o302, parse_single_reg(src_reg)),
+    "ADC"   : (0o303, parse_single_reg(src_reg)),
+    "SHL"   : (0o304, parse_single_reg(src_reg)),
+    "SHR"   : (0o305, parse_single_reg(src_reg)),
 }
 
 
 def main():
-    while True:
+    if len(sys.argv) == 1:
         print(pc, end=" ")
         line = input()
-        parse_ln(line)
+        while line != "q!":
+            parse_ln(line)
+            print(pc, end=" ")
+            line = input()
+
+    outfile_name = "z.bin"
+    for fname in sys.argv[1:]:
+        if fname.startswith("o:"):
+            outfile_name = fname[2:]
+            continue
+        with open(fname, "r") as fin:
+            lines = fin.readlines()
+            for line in lines:
+                parse_ln(line)
+    
+    resolve_lbls()
+    with open(outfile_name, "wb") as fout:
+        bs = fout.write(memory[:pc])
+        print(str(bs) + " bytes written")
+
 
 main()

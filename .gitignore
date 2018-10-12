@@ -2,3 +2,5 @@
 include/
 zas.c
 zas
+ram
+*.bin
